@@ -1,0 +1,21 @@
+{
+  "camera_index": 1,
+  "capture_width": 1920,
+  "capture_height": 1080,
+  "monitor_width": 640,
+  "monitor_height": 360,
+  "monitor_fps": 3.0,
+  "roi_x": 115,
+  "roi_y": 107,
+  "roi_width": 391,
+  "roi_height": 251,
+  "diff_threshold": 25,
+  "min_changed_ratio": 0.02,
+  "confirm_frames": 3,
+  "blur_ksize": 5,
+  "morph_ksize": 3,
+  "stability_threshold": 0.005,
+  "stability_time": 0.8,
+  "background_frames": 15,
+  "background_sample_interval": 0.1
+}
