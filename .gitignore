@@ -11,3 +11,9 @@ wheels/
 
 # Enviroment variables
 .env
+
+# Captures
+captures
+
+# Background
+background.npy

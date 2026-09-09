@@ -348,8 +348,8 @@ def _setup_logging(debug: bool) -> None:
         format="[%(levelname)s] %(message)s",
     )
     if not debug:
-        # Keep our logs light: silence SDK/HTTP chatter unless debugging.
-        for name in ("google", "google_genai", "httpx", "httpcore", "urllib3"):
+        # Keep our logs light: silence HTTP chatter unless debugging.
+        for name in ("urllib3",):
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
