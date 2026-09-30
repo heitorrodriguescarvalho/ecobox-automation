@@ -17,3 +17,6 @@ captures
 
 # Background
 background.npy
+
+# Config
+config.json

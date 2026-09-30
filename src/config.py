@@ -7,7 +7,7 @@ defaults) so no magic numbers are scattered across the codebase.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,9 @@ class Config:
     # --- Debug ---
     # When True, opens debug windows and overlays.
     debug: bool = False
+    # When True, debug object detection without sending images to Gemini:
+    # opens the debug view window and logs detection/confirmation to terminal.
+    object_detection_debug: bool = False
     # Preview refresh rate in debug mode. Higher = fresher feed, more CPU.
     # Kept separate from monitor_fps so detection cadence stays low.
     debug_display_fps: float = 10.0
@@ -94,6 +97,29 @@ class Config:
     classification_image_height: int = 640
     # JPEG quality for the image sent to Gemini (0..100, 75..85 recommended).
     jpeg_quality: int = 80
+
+    # --- Serial actuator link (optional) ---
+    # When True, a message is written to the serial port for every classified
+    # object (e.g. an Arduino sorting flaps/servos). When False (default),
+    # nothing is opened and the pipeline behaves as before.
+    serial_enabled: bool = False
+    # Serial device, e.g. "/dev/ttyUSB0" or "/dev/ttyACM0" (Arduino).
+    serial_port: str = "/dev/ttyUSB0"
+    serial_baudrate: int = 9600
+    # Read timeout in seconds for the serial port.
+    serial_timeout: float = 1.0
+    # Line ending appended to every message ("\\n" suits Arduino Serial).
+    serial_line_ending: str = "\n"
+    # Object mapping trash type -> message sent over serial. "unknown" is
+    # intentionally absent: it falls back to the "non-recyclable" message.
+    serial_messages: dict[str, str] = field(
+        default_factory=lambda: {
+            "plastic": "PLASTIC",
+            "paper": "PAPER",
+            "metal": "METAL",
+            "non-recyclable": "NON_RECYCLABLE",
+        }
+    )
 
     @property
     def roi(self) -> tuple[int, int, int, int]:

@@ -30,6 +30,7 @@ from .gemini import (
     ClassificationRejectedError,
     GeminiClassifier,
 )
+from .serial_sender import SerialError, SerialSender
 from .state_machine import State, StateMachine
 
 load_dotenv()
@@ -38,7 +39,8 @@ log = logging.getLogger("ecobox.main")
 
 # Lightweight logs on state transitions.
 STATE_LOGS = {
-    State.OBJECT_DETECTED: "Object detected",
+    State.POSSIBLE_OBJECT: "Object detected",
+    State.OBJECT_DETECTED: "Object confirmed",
     State.READY_TO_CAPTURE: "Object stabilized",
     State.WAITING_FOR_EMPTY: "Waiting for bin to become empty",
 }
@@ -60,6 +62,7 @@ class Pipeline:
         self.detector = Detector(config)
         self.state_machine = StateMachine(config)
         self.capture = Capture(config)
+        self.serial = SerialSender(config)
         self._background = self._load_background()
         self._prev_state: State | None = None
 
@@ -70,6 +73,16 @@ class Pipeline:
             self.detector.set_background(bg)
             return bg
         return None
+
+    @property
+    def is_object_detected(self) -> bool:
+        """Check at any time whether an object is currently detected."""
+        return self.state_machine.is_object_detected
+
+    @property
+    def is_object_confirmed(self) -> bool:
+        """Check at any time whether the object was confirmed."""
+        return self.state_machine.is_object_confirmed
 
     def calibrate_now(self) -> None:
         from .detector import calibrate_background
@@ -93,12 +106,23 @@ class Pipeline:
             log.error("No background found. Calibrate first: uv run ecobox-calibrate")
             raise SystemExit(1)
 
+        if cfg.serial_enabled:
+            try:
+                self.serial.open()
+            except SerialError as e:
+                log.warning("Serial open failed at startup (%s); will retry per object", e)
+                # Detection/classification continues; send() retries open per
+                # object so a late-plugged Arduino still works.
+
         interval = 1.0 / max(cfg.monitor_fps, 0.001)
         display_interval = 1.0 / max(cfg.debug_display_fps, 0.001)
         last_analysis = 0.0
         last_display = 0.0
 
-        if cfg.debug:
+        # object_detection_debug implies the debug view window, but never
+        # sends images to Gemini (see _on_capture_ready).
+        show_window = cfg.debug or cfg.object_detection_debug
+        if show_window:
             cv2_window_ready(gemini_debug=cfg.gemini_debug)
             if cfg.gemini_debug:
                 # Keep the window small and out of the way so the terminal
@@ -110,7 +134,7 @@ class Pipeline:
             while True:
                 now = time.monotonic()
 
-                if not cfg.debug:
+                if not show_window:
                     if now - last_analysis < interval:
                         time.sleep(0.01)
                         continue
@@ -163,6 +187,7 @@ class Pipeline:
             pass
         finally:
             cv2_destroy_windows()
+            self.serial.close()
             self.camera.release()
 
     def _on_capture_ready(self) -> None:
@@ -170,6 +195,14 @@ class Pipeline:
         cfg = self.config
         # READY_TO_CAPTURE -> CLASSIFYING: block new detections.
         self.state_machine.finish_capture()
+
+        if cfg.object_detection_debug:
+            # Debug mode: never send images to Gemini; just log and wait
+            # for the bin to become empty again.
+            log.info("object_detection_debug: object stabilized, skipping Gemini")
+            self.state_machine.finish_classification()
+            self.state_machine.finish_processing()
+            return
 
         first_image = self.capture.grab(self.camera)
         if cfg.debug:
@@ -256,22 +289,40 @@ class Pipeline:
         return last
 
     def _handle_result(self, result: ClassificationResult) -> None:
-        if (
+        accepted = (
             result.success
             and result.confidence >= self.config.classification_confidence_threshold
-        ):
+        )
+        if accepted:
             log.info(
                 "Classification: %s (confidence=%.2f)",
                 result.category,
                 result.confidence,
             )
             sort_waste(result.category, result.confidence)
+            self._send_serial(result.category)
         else:
+            # Inconclusive (low confidence / API error / skipped): sort as
+            # non-recyclable instead of dropping the object.
             log.info(
                 "Classification: unknown (attempts=%d, success=%s)",
                 result.attempts,
                 result.success,
             )
+            sort_waste("non-recyclable", 0.0)
+            self._send_serial("unknown")
+
+    def _send_serial(self, category: str) -> None:
+        """Send the serial message for ``category`` (unknown -> non-recyclable).
+
+        Never raises: serial failures are logged and the pipeline continues.
+        """
+        if not self.config.serial_enabled:
+            return
+        try:
+            self.serial.send(category)
+        except SerialError as e:
+            log.error("Serial send failed: %s", e)
 
 
 def cv2_window_ready(gemini_debug: bool = False) -> None:
@@ -312,18 +363,41 @@ def cv2_destroy_windows() -> None:
 
 
 def _build_config(args) -> Config:
-    config = load_or_default(args.config or "config.json")
-    if args.index is not None:
-        from dataclasses import asdict
+    from dataclasses import asdict
 
-        d = asdict(config)
+    config = load_or_default(args.config or "config.json")
+    d = asdict(config)
+    if args.index is not None:
         d["camera_index"] = args.index
-        config = Config(**d)
+    # Serial options: explicit flags win, then env vars, then config.json.
+    if getattr(args, "serial_port", None):
+        d["serial_enabled"] = True
+        d["serial_port"] = args.serial_port
+    elif getattr(args, "no_serial", False):
+        d["serial_enabled"] = False
+    elif getattr(args, "serial", False) or os.environ.get("ECOBOX_SERIAL_ENABLED"):
+        d["serial_enabled"] = True
+    elif os.environ.get("ECOBOX_SERIAL_PORT"):
+        d["serial_enabled"] = True
+        d["serial_port"] = os.environ["ECOBOX_SERIAL_PORT"]
+    if getattr(args, "serial_baudrate", None) is not None:
+        d["serial_baudrate"] = args.serial_baudrate
+    elif os.environ.get("ECOBOX_SERIAL_BAUDRATE"):
+        try:
+            d["serial_baudrate"] = int(os.environ["ECOBOX_SERIAL_BAUDRATE"])
+        except ValueError:
+            pass
+    config = Config(**d)
     want_debug = args.debug or os.environ.get("ECOBOX_DEBUG")
     want_gd = (
         args.gemini_debug
         or os.environ.get("ECOBOX_GEMINI_DEBUG")
         or config.gemini_debug
+    )
+    want_odd = (
+        args.object_detection_debug
+        or os.environ.get("ECOBOX_OBJECT_DETECTION_DEBUG")
+        or config.object_detection_debug
     )
     if want_debug or want_gd:
         # gemini_debug implies the camera preview window, so the user can
@@ -338,6 +412,12 @@ def _build_config(args) -> Config:
 
         d = asdict(config)
         d["gemini_debug"] = True
+        config = Config(**d)
+    if want_odd:
+        from dataclasses import asdict
+
+        d = asdict(config)
+        d["object_detection_debug"] = True
         config = Config(**d)
     return config
 
@@ -380,6 +460,14 @@ def run_image_test(image_path: Path, config: Config) -> None:
         result.attempts,
     )
     print(f"{result.category}\t{result.confidence:.3f}")
+    if config.serial_enabled:
+        sender = SerialSender(config)
+        try:
+            sender.send(result.category)
+        except SerialError as e:
+            log.error("Serial send failed: %s", e)
+        finally:
+            sender.close()
 
 
 def main() -> None:
@@ -397,9 +485,41 @@ def main() -> None:
         "(also opens the camera preview)",
     )
     parser.add_argument(
+        "--object-detection-debug",
+        action="store_true",
+        help="debug object detection without Gemini: open the debug view "
+        "window and log detection/confirmation to the terminal; "
+        "no images are sent to Gemini",
+    )
+    parser.add_argument(
         "--recalibrate",
         action="store_true",
         help="recalibrate background before starting",
+    )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="enable serial output (uses serial_port/serial_baudrate from "
+        "config.json unless --serial-port/--serial-baudrate is given)",
+    )
+    parser.add_argument(
+        "--serial-port",
+        default=None,
+        metavar="PORT",
+        help='enable serial output on PORT (e.g. "/dev/ttyUSB0", "/dev/ttyACM0", '
+        '"COM3"). Implies --serial.',
+    )
+    parser.add_argument(
+        "--serial-baudrate",
+        type=int,
+        default=None,
+        metavar="BAUD",
+        help="serial baudrate (default from config.json, usually 9600)",
+    )
+    parser.add_argument(
+        "--no-serial",
+        action="store_true",
+        help="force serial output off, even if enabled in config.json",
     )
     parser.add_argument(
         "--image",

@@ -42,6 +42,29 @@ class StateMachine:
     def reset(self) -> None:
         self.__init__(self.config)
 
+    @property
+    def is_object_detected(self) -> bool:
+        """True when an object is currently detected (any time query)."""
+        return self.state in (
+            State.POSSIBLE_OBJECT,
+            State.OBJECT_DETECTED,
+            State.WAITING_FOR_STABILITY,
+            State.READY_TO_CAPTURE,
+            State.CLASSIFYING,
+            State.CLASSIFIED,
+        )
+
+    @property
+    def is_object_confirmed(self) -> bool:
+        """True once the object passed ``confirm_frames`` confirmation."""
+        return self.state in (
+            State.OBJECT_DETECTED,
+            State.WAITING_FOR_STABILITY,
+            State.READY_TO_CAPTURE,
+            State.CLASSIFYING,
+            State.CLASSIFIED,
+        )
+
     def update(self, analysis: Analysis, now: float | None = None) -> State:
         now = now if now is not None else time.monotonic()
         ratio = analysis.changed_ratio
