@@ -120,6 +120,18 @@ class Config:
             "non-recyclable": "NON_RECYCLABLE",
         }
     )
+    # Seconds of continuous stillness (no inter-frame motion) required BEFORE
+    # the serial message is sent. The sorter moving the garbage changes the
+    # image, so actuating mid-motion mis-sorts; 0 disables the wait.
+    serial_settle_time: float = 0.0
+    # Max seconds to wait for stillness before sending anyway (safety valve
+    # so a restless scene never blocks the pipeline forever; 0 = wait forever).
+    serial_settle_timeout: float = 30.0
+    # Seconds AFTER the serial message is sent during which detections are
+    # ignored. Sending makes the sorter move the garbage, which changes the
+    # image — without this blind window that motion looks like new trash and
+    # triggers a false extra sort; 0 disables it.
+    serial_ignore_time: float = 0.0
 
     @property
     def roi(self) -> tuple[int, int, int, int]:

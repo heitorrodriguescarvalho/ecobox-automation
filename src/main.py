@@ -65,6 +65,10 @@ class Pipeline:
         self.serial = SerialSender(config)
         self._background = self._load_background()
         self._prev_state: State | None = None
+        self._show_window = False
+        # Monotonic timestamp until which detections are ignored (blind window
+        # after a serial send while the sorter moves the garbage).
+        self._ignore_until = 0.0
 
     def _load_background(self) -> np.ndarray | None:
         path = Path(self.config.background_path)
@@ -122,6 +126,7 @@ class Pipeline:
         # object_detection_debug implies the debug view window, but never
         # sends images to Gemini (see _on_capture_ready).
         show_window = cfg.debug or cfg.object_detection_debug
+        self._show_window = show_window
         if show_window:
             cv2_window_ready(gemini_debug=cfg.gemini_debug)
             if cfg.gemini_debug:
@@ -143,6 +148,11 @@ class Pipeline:
                     if bgr is None:
                         continue
                     analysis = self.detector.analyze(bgr)
+                    # Blind window: the sorter is moving the garbage, so the
+                    # image is changing — keep the analysis flowing (fresh
+                    # motion baseline) but don't feed the state machine.
+                    if self._detections_ignored(now):
+                        continue
                     state = self.state_machine.update(analysis, now=now)
                     self._notify_state(state)
                     if state is State.READY_TO_CAPTURE:
@@ -164,10 +174,14 @@ class Pipeline:
                 analysis = self.detector.analyze(bgr)
                 if now - last_analysis >= interval:
                     last_analysis = now
-                    state = self.state_machine.update(analysis, now=now)
-                    self._notify_state(state)
-                    if state is State.READY_TO_CAPTURE:
-                        self._on_capture_ready()
+                    # Same blind window as headless mode (see above).
+                    if self._detections_ignored(now):
+                        log.debug("Ignoring detection (sorter moving)")
+                    else:
+                        state = self.state_machine.update(analysis, now=now)
+                        self._notify_state(state)
+                        if state is State.READY_TO_CAPTURE:
+                            self._on_capture_ready()
 
                 canvas = render_debug(
                     bgr,
@@ -315,14 +329,92 @@ class Pipeline:
     def _send_serial(self, category: str) -> None:
         """Send the serial message for ``category`` (unknown -> non-recyclable).
 
-        Never raises: serial failures are logged and the pipeline continues.
+        When ``serial_settle_time`` > 0, first waits for the scene to stay
+        still that long (the sorter moving garbage changes the image, so
+        actuating mid-motion mis-sorts). Never raises: serial failures are
+        logged and the pipeline continues.
         """
         if not self.config.serial_enabled:
             return
+        self._wait_for_settle()
         try:
             self.serial.send(category)
         except SerialError as e:
             log.error("Serial send failed: %s", e)
+            return
+        ignore = max(0.0, self.config.serial_ignore_time)
+        if ignore > 0:
+            self._ignore_until = time.monotonic() + ignore
+            log.info("Ignoring detections for %.1fs (sorter moving)", ignore)
+
+    def _detections_ignored(self, now: float) -> bool:
+        """True while inside the post-send blind window (see serial_ignore_time)."""
+        return now < self._ignore_until
+
+    def _wait_for_settle(self) -> None:
+        """Wait for ``serial_settle_time`` of continuous stillness.
+
+        Stillness = inter-frame motion at/below ``stability_threshold`` (the
+        object may still be sitting in the ROI; only *movement* resets the
+        timer). If ``serial_settle_timeout`` elapses first, gives up waiting
+        and returns so the message is still sent (a restless scene must never
+        stall the bin). Raises KeyboardInterrupt if the user quits from the
+        debug window.
+        """
+        cfg = self.config
+        need = max(0.0, cfg.serial_settle_time)
+        if need <= 0:
+            return
+        timeout = max(0.0, cfg.serial_settle_timeout)
+        interval = 1.0 / max(cfg.monitor_fps, 0.001)
+        log.info("Waiting for scene to settle (%.1fs still) before serial send", need)
+        start = time.monotonic()
+        still_since: float | None = None
+        while True:
+            now = time.monotonic()
+            if timeout > 0 and now - start >= timeout:
+                log.warning(
+                    "Scene did not settle within %.1fs; sending serial anyway",
+                    timeout,
+                )
+                return
+            bgr = self.camera.read_monitor()
+            if bgr is None:
+                time.sleep(0.05)
+                continue
+            analysis = self.detector.analyze(bgr)
+            if analysis.motion_ratio <= cfg.stability_threshold:
+                if still_since is None:
+                    still_since = now
+                elif now - still_since >= need:
+                    log.info("Scene settled; sending serial")
+                    return
+            else:
+                if still_since is not None:
+                    log.debug(
+                        "Motion during settle wait (%.3f); restarting timer",
+                        analysis.motion_ratio,
+                    )
+                still_since = None
+            if self._show_window:
+                canvas = render_debug(
+                    bgr,
+                    self._background,
+                    analysis,
+                    self.state_machine.state,
+                    cfg.roi,
+                    analysis.changed_ratio,
+                )
+                show_debug("ecobox-debug", canvas)
+                key = cv2_wait_key(1) & 0xFF
+                if key == ord("r"):
+                    self.calibrate_now()
+                    still_since = None
+                    start = time.monotonic()
+                if key in (ord("q"), 27):
+                    raise KeyboardInterrupt
+            else:
+                time.sleep(interval)
 
 
 def cv2_window_ready(gemini_debug: bool = False) -> None:
